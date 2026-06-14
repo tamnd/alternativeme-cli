@@ -1,62 +1,144 @@
 // Package alternativeme is the library behind the alternativeme command line:
-// the HTTP client, request shaping, and the typed data models for alternativeme.
+// the HTTP client, request shaping, and the typed data models for the
+// Alternative.me Crypto Fear & Greed Index.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// The Client sets a real User-Agent, paces requests to stay polite, and
+// retries transient failures (429 and 5xx). Build your endpoint calls and
+// JSON decoding on top of it.
 package alternativeme
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
+	"strconv"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to alternativeme. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "alternativeme/dev (+https://github.com/tamnd/alternativeme-cli)"
-
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at alternativeme.com; change it once you
-// know the real endpoints you want to read.
-const Host = "alternativeme.com"
+// Host is the API hostname.
+const Host = "api.alternative.me"
 
 // BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+const BaseURL = "https://api.alternative.me"
 
-// Client talks to alternativeme over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// Config holds all tunables for a Client.
+type Config struct {
+	BaseURL   string
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+	Rate      time.Duration
+	Retries   int
+	Timeout   time.Duration
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
+// DefaultConfig returns sensible defaults.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   BaseURL,
+		UserAgent: "tamnd-alternativeme-cli/0.1 (tamnd87@gmail.com)",
 		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Retries:   3,
+		Timeout:   10 * time.Second,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client talks to alternative.me over HTTP.
+type Client struct {
+	HTTP      *http.Client
+	cfg       Config
+	last      time.Time
+}
+
+// NewClient returns a Client configured with DefaultConfig.
+func NewClient() *Client {
+	cfg := DefaultConfig()
+	return &Client{
+		HTTP: &http.Client{Timeout: cfg.Timeout},
+		cfg:  cfg,
+	}
+}
+
+// NewClientFromConfig builds a Client from the given Config.
+func NewClientFromConfig(cfg Config) *Client {
+	return &Client{
+		HTTP: &http.Client{Timeout: cfg.Timeout},
+		cfg:  cfg,
+	}
+}
+
+// FearGreedRecord is one day's Fear & Greed reading.
+type FearGreedRecord struct {
+	Timestamp      string `json:"timestamp" kit:"id"`
+	Value          int    `json:"value"`
+	Classification string `json:"classification"`
+}
+
+// wire types — match the JSON the API actually returns.
+
+type wireResponse struct {
+	Name     string       `json:"name"`
+	Data     []wireRecord `json:"data"`
+	Metadata wireMeta     `json:"metadata"`
+}
+
+type wireRecord struct {
+	Value               string `json:"value"`
+	ValueClassification string `json:"value_classification"`
+	Timestamp           string `json:"timestamp"`
+	TimeUntilUpdate     string `json:"time_until_update"`
+}
+
+type wireMeta struct {
+	Error *string `json:"error"`
+}
+
+// GetFearGreed fetches limit days of the Crypto Fear & Greed Index.
+// Limit 1 returns today's reading only. The timestamp is converted from a
+// Unix second string to "2006-01-02" format; value is converted from a JSON
+// string ("18") to int.
+func (c *Client) GetFearGreed(ctx context.Context, limit int) ([]FearGreedRecord, error) {
+	if limit < 1 {
+		limit = 1
+	}
+	url := fmt.Sprintf("%s/fng/?limit=%d", c.cfg.BaseURL, limit)
+	body, err := c.get(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+
+	var wire wireResponse
+	if err := json.Unmarshal(body, &wire); err != nil {
+		return nil, fmt.Errorf("decode fear greed response: %w", err)
+	}
+	if wire.Metadata.Error != nil && *wire.Metadata.Error != "" {
+		return nil, fmt.Errorf("api error: %s", *wire.Metadata.Error)
+	}
+
+	out := make([]FearGreedRecord, 0, len(wire.Data))
+	for _, w := range wire.Data {
+		v, err := strconv.Atoi(w.Value)
+		if err != nil {
+			return nil, fmt.Errorf("parse value %q: %w", w.Value, err)
+		}
+		ts, err := strconv.ParseInt(w.Timestamp, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse timestamp %q: %w", w.Timestamp, err)
+		}
+		date := time.Unix(ts, 0).UTC().Format("2006-01-02")
+		out = append(out, FearGreedRecord{
+			Timestamp:      date,
+			Value:          v,
+			Classification: w.ValueClassification,
+		})
+	}
+	return out, nil
+}
+
+// get fetches url and returns the response body, with pacing and retries.
+func (c *Client) get(ctx context.Context, url string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -82,7 +164,7 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
@@ -104,12 +186,12 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	return b, false, nil
 }
 
-// pace blocks until at least Rate has passed since the previous request.
+// pace blocks until at least Rate has passed since the last request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
@@ -121,80 +203,4 @@ func backoff(attempt int) time.Duration {
 		d = 5 * time.Second
 	}
 	return d
-}
-
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on alternativeme.com. It is a stand-in for the typed records you
-// will model from the real alternativeme endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `alternativeme cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }

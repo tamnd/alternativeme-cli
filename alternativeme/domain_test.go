@@ -2,13 +2,10 @@ package alternativeme
 
 import (
 	"testing"
-
-	"github.com/tamnd/any-cli/kit"
 )
 
-// These tests are offline: they exercise the URI driver's pure string functions
-// and the host wiring (mint, body, resolve), which need no network. The client's
-// HTTP behaviour is covered in alternativeme_test.go.
+// These tests are offline: they exercise the URI driver's pure string functions.
+// Network behaviour is covered in alternativeme_test.go.
 
 func TestDomainInfo(t *testing.T) {
 	info := Domain{}.Info()
@@ -24,10 +21,12 @@ func TestDomainInfo(t *testing.T) {
 }
 
 func TestClassify(t *testing.T) {
-	cases := []struct{ in, typ, id string }{
-		{"wiki/Go", "page", "wiki/Go"},
-		{"/about/", "page", "about"},
-		{"https://" + Host + "/team/contact", "page", "team/contact"},
+	cases := []struct {
+		in, typ, id string
+	}{
+		{"feargreed", "index", "feargreed"},
+		{"index", "index", "feargreed"},
+		{"2024-01-01", "date", "2024-01-01"},
 	}
 	for _, tc := range cases {
 		typ, id, err := Domain{}.Classify(tc.in)
@@ -39,38 +38,23 @@ func TestClassify(t *testing.T) {
 }
 
 func TestLocate(t *testing.T) {
-	got, err := Domain{}.Locate("page", "wiki/Go")
-	want := "https://" + Host + "/wiki/Go"
+	got, err := Domain{}.Locate("index", "feargreed")
+	want := "https://alternative.me/crypto/fear-and-greed-index/"
 	if err != nil || got != want {
 		t.Errorf("Locate = (%q, %v), want (%q, nil)", got, err, want)
 	}
 }
 
-// TestHostWiring mounts the driver in a kit Host (the runtime ant drives) and
-// checks the round trip: a record mints to its URI, its body is readable, and a
-// bare id resolves back to the same URI. The init in domain.go registers the
-// domain, so kit.Open finds it.
-func TestHostWiring(t *testing.T) {
-	h, err := kit.Open()
-	if err != nil {
-		t.Fatal(err)
+func TestLocateUnknownType(t *testing.T) {
+	_, err := Domain{}.Locate("bogus", "x")
+	if err == nil {
+		t.Error("expected error for unknown type, got nil")
 	}
+}
 
-	p := &Page{ID: "wiki/Go", URL: "https://" + Host + "/wiki/Go", Title: "Go", Body: "Go is a language."}
-	u, err := h.Mint(p)
-	if err != nil {
-		t.Fatalf("Mint: %v", err)
-	}
-	if want := "alternativeme://page/wiki/Go"; u.String() != want {
-		t.Errorf("Mint = %q, want %q", u.String(), want)
-	}
-
-	if body, ok := h.Body(p); !ok || body == "" {
-		t.Errorf("Body = (%q, %v), want non-empty", body, ok)
-	}
-
-	got, err := h.ResolveOn("alternativeme", "about")
-	if err != nil || got.String() != "alternativeme://page/about" {
-		t.Errorf("ResolveOn = (%q, %v), want alternativeme://page/about", got.String(), err)
+func TestClassifyUnknown(t *testing.T) {
+	_, _, err := Domain{}.Classify("notaresource")
+	if err == nil {
+		t.Error("expected error for unknown input, got nil")
 	}
 }
